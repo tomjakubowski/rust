@@ -10,7 +10,7 @@
 
 //! An owned, growable vector.
 
-use cast::{forget, transmute};
+use RawVec = raw::Vec;
 use clone::Clone;
 use cmp::{Ord, Eq, Ordering, TotalEq, TotalOrd};
 use container::{Container, Mutable};
@@ -18,17 +18,17 @@ use default::Default;
 use fmt;
 use iter::{DoubleEndedIterator, FromIterator, Extendable, Iterator, range};
 use libc::{free, c_void};
+use mem::{forget, transmute};
 use mem::{size_of, move_val_init};
 use mem;
-use num;
 use num::{CheckedMul, CheckedAdd};
+use num;
 use ops::{Add, Drop};
 use option::{None, Option, Some, Expect};
 use ptr::RawPtr;
 use ptr;
-use rt::global_heap::{malloc_raw, realloc_raw};
 use raw::Slice;
-use RawVec = raw::Vec;
+use rt::global_heap::{malloc_raw, realloc_raw};
 use slice::{ImmutableEqVector, ImmutableVector, Items, MutItems, MutableVector};
 use slice::{MutableTotalOrdVector, OwnedVector, Vector};
 use slice::{MutableVectorAllocating};
