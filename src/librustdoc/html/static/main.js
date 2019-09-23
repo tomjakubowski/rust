@@ -1594,7 +1594,7 @@ function getSearchElement() {
             searchIndex = [];
             var structVariantPaths = new Map();
             var searchWords = [];
-            var i, j;
+            var i;
 
             for (var crate in rawSearchIndex) {
                 if (!rawSearchIndex.hasOwnProperty(crate)) { continue; }
