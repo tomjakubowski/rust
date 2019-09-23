@@ -1322,14 +1322,22 @@ function getSearchElement() {
                 var myparent = item.parent;
                 var anchor = "#" + type + "." + name;
                 var parentType = itemTypes[myparent.ty];
+                var pageType = parentType;
+                var pageName = myparent.name;
+
                 if (parentType === "primitive") {
                     displayPath = myparent.name + "::";
+                } else if (type === "structfield" && parentType === "variant") {
+                    displayPath = item.path + "::" + myparent.enumName + "::" + myparent.name + "::";
+                    anchor = "#variant." + myparent.name + ".field." + name;
+                    pageType = "enum";
+                    pageName = myparent.enumName;
                 } else {
                     displayPath = item.path + "::" + myparent.name + "::";
                 }
                 href = rootPath + item.path.replace(/::/g, "/") +
-                       "/" + parentType +
-                       "." + myparent.name +
+                       "/" + pageType +
+                       "." + pageName +
                        ".html" + anchor;
             } else {
                 displayPath = item.path + "::";
@@ -1584,8 +1592,9 @@ function getSearchElement() {
 
         function buildIndex(rawSearchIndex) {
             searchIndex = [];
+            var structVariantPaths = new Map();
             var searchWords = [];
-            var i;
+            var i, j;
 
             for (var crate in rawSearchIndex) {
                 if (!rawSearchIndex.hasOwnProperty(crate)) { continue; }
@@ -1609,12 +1618,29 @@ function getSearchElement() {
                 var items = rawSearchIndex[crate].i;
                 // an array of [(Number) item type,
                 //              (String) name]
-                var paths = rawSearchIndex[crate].p;
+                var rawPaths = rawSearchIndex[crate].p;
+                // an object where each key is a (String) path index of an enum
+                // variant, and for each key its value is an array of (Number)
+                // path indices for its struct-like variants
+                var rawStructVariantPaths = rawSearchIndex[crate].svp;
 
-                // convert `paths` into an object form
-                var len = paths.length;
+                // invert the multimap so enum path index can be looked up by variant index.
+                for (let [enumIdx, variantIdxs] of Object.entries(rawStructVariantPaths)) {
+                    for (let variantIdx of variantIdxs) {
+                        structVariantPaths.set(variantIdx, Number(enumIdx));
+                    }
+                }
+
+                // convert `rawPaths` entries into object form
+                var len = rawPaths.length;
+                var paths = [];
                 for (i = 0; i < len; ++i) {
-                    paths[i] = {ty: paths[i][0], name: paths[i][1]};
+                    var path = {ty: rawPaths[i][0], name: rawPaths[i][1]};
+                    if (itemTypes[path.ty] === "variant" && structVariantPaths.has(i)) {
+                        let enumIdx = structVariantPaths.get(i);
+                        path.enumName = rawPaths[enumIdx][1];
+                    }
+                    paths.push(path);
                 }
 
                 // convert `items` into an object form, and construct word indices.

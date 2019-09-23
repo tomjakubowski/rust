@@ -284,7 +284,7 @@ pub struct Cache {
     /// found on that implementation.
     pub impls: FxHashMap<DefId, Vec<Impl>>,
 
-    /// Maintains a mapping of local crate `NodeId`s to the fully qualified name
+    /// Maintains a mapping of local crate `DefId`s to the fully qualified name
     /// and "short type description" of that node. This is used when generating
     /// URLs when a type is being linked to. External paths are not located in
     /// this map because the `External` type itself has all the information
@@ -333,10 +333,11 @@ pub struct Cache {
     pub crate_version: Option<String>,
 
     // Private fields only used when initially crawling a crate to build a cache
-
-    stack: Vec<String>,
+    // Stack of URL path segments to the item being crawled
+    path_stack: Vec<String>,
     parent_stack: Vec<DefId>,
     parent_is_trait_impl: bool,
+    parent_is_variant: bool,
     search_index: Vec<IndexItem>,
     stripped_mod: bool,
     deref_trait_did: Option<DefId>,
@@ -363,6 +364,10 @@ pub struct Cache {
     /// Aliases added through `#[doc(alias = "...")]`. Since a few items can have the same alias,
     /// we need the alias element to have an array of items.
     aliases: FxHashMap<String, Vec<IndexItem>>,
+
+    /// Struct field items which belong to struct-like enum variants need special treatment the
+    /// search index, because enum variants don't have their own pages to link to.
+    enum_structvariants: FxHashMap<DefId, Vec<DefId>>,
 }
 
 /// Temporary storage for data obtained during `RustdocVisitor::clean()`.
@@ -614,10 +619,11 @@ pub fn run(mut krate: clean::Crate,
         exact_paths,
         paths: Default::default(),
         implementors: Default::default(),
-        stack: Vec::new(),
+        path_stack: Vec::new(),
         parent_stack: Vec::new(),
         search_index: Vec::new(),
         parent_is_trait_impl: false,
+        parent_is_variant: false,
         extern_locations: Default::default(),
         primitive_locations: Default::default(),
         stripped_mod: false,
@@ -631,6 +637,7 @@ pub fn run(mut krate: clean::Crate,
         owned_box_did,
         masked_crates: mem::take(&mut krate.masked_crates),
         aliases: Default::default(),
+        enum_structvariants: Default::default(),
     };
 
     // Cache where all our extern crates are located
@@ -663,7 +670,7 @@ pub fn run(mut krate: clean::Crate,
         cache.primitive_locations.insert(prim, def_id);
     }
 
-    cache.stack.push(krate.name.clone());
+    cache.path_stack.push(krate.name.clone());
     krate = cache.fold_crate(krate);
 
     for (trait_did, dids, impl_) in cache.orphan_trait_impls.drain(..) {
@@ -702,13 +709,14 @@ pub fn run(mut krate: clean::Crate,
 
 /// Builds the search index from the collected metadata
 fn build_index(krate: &clean::Crate, cache: &mut Cache) -> String {
-    let mut nodeid_to_pathid = FxHashMap::default();
+    let mut defid_to_pathid = FxHashMap::default();
     let mut crate_items = Vec::with_capacity(cache.search_index.len());
     let mut crate_paths = Vec::<Json>::new();
 
     let Cache { ref mut search_index,
                 ref orphan_impl_items,
-                ref mut paths, .. } = *cache;
+                ref mut paths,
+                ref enum_structvariants, .. } = *cache;
 
     // Attach all orphan items to the type's definition if the type
     // has since been learned.
@@ -726,21 +734,21 @@ fn build_index(krate: &clean::Crate, cache: &mut Cache) -> String {
         }
     }
 
-    // Reduce `NodeId` in paths into smaller sequential numbers,
+    // Reduce `DefId` in paths into smaller sequential numbers,
     // and prune the paths that do not appear in the index.
     let mut lastpath = String::new();
     let mut lastpathid = 0usize;
 
     for item in search_index {
-        item.parent_idx = item.parent.map(|nodeid| {
-            if nodeid_to_pathid.contains_key(&nodeid) {
-                *nodeid_to_pathid.get(&nodeid).unwrap()
+        item.parent_idx = item.parent.map(|defid| {
+            if defid_to_pathid.contains_key(&defid) {
+                *defid_to_pathid.get(&defid).unwrap()
             } else {
                 let pathid = lastpathid;
-                nodeid_to_pathid.insert(nodeid, pathid);
+                defid_to_pathid.insert(defid, pathid);
                 lastpathid += 1;
 
-                let &(ref fqp, short) = paths.get(&nodeid).unwrap();
+                let &(ref fqp, short) = paths.get(&defid).unwrap();
                 crate_paths.push(((short as usize), fqp.last().unwrap().clone()).to_json());
                 pathid
             }
@@ -755,6 +763,15 @@ fn build_index(krate: &clean::Crate, cache: &mut Cache) -> String {
         crate_items.push(item.to_json());
     }
 
+    let mut crate_structvariant_paths = BTreeMap::new();
+    for (enum_defid, variant_defids) in enum_structvariants {
+        if let Some(enum_pathid) = defid_to_pathid.get(&enum_defid) {
+            let variant_pathids: Vec<usize> = variant_defids.iter()
+                .filter_map(|did| defid_to_pathid.get(&did)).cloned().collect();
+            crate_structvariant_paths.insert(enum_pathid.to_string(), variant_pathids.to_json());
+        }
+    }
+
     let crate_doc = krate.module.as_ref().map(|module| {
         shorten(plain_summary_line(module.doc_value()))
     }).unwrap_or(String::new());
@@ -763,6 +780,7 @@ fn build_index(krate: &clean::Crate, cache: &mut Cache) -> String {
     crate_data.insert("doc".to_owned(), Json::String(crate_doc));
     crate_data.insert("i".to_owned(), Json::Array(crate_items));
     crate_data.insert("p".to_owned(), Json::Array(crate_paths));
+    crate_data.insert("svp".to_owned(), Json::Object(crate_structvariant_paths));
 
     // Collect the index into a string
     format!("searchIndex[{}] = {};",
@@ -1410,13 +1428,20 @@ impl DocFolder for Cache {
                     // skip associated items in trait impls
                     ((None, None), false)
                 }
-                clean::AssocTypeItem(..) |
-                clean::TyMethodItem(..) |
-                clean::StructFieldItem(..) |
-                clean::VariantItem(..) => {
-                    ((Some(*self.parent_stack.last().unwrap()),
-                      Some(&self.stack[..self.stack.len() - 1])),
-                     false)
+                clean::AssocTypeItem(..)
+                | clean::TyMethodItem(..)
+                | clean::StructFieldItem(..)
+                | clean::VariantItem(..) => {
+                    // Variants don't have their own pages, so we remove an extra segment from
+                    // path_stack for their structfield children
+                    let path_chop = if self.parent_is_variant { 2 } else { 1 };
+                    (
+                        (
+                            Some(*self.parent_stack.last().unwrap()),
+                            Some(&self.path_stack[..self.path_stack.len() - path_chop]),
+                        ),
+                        false,
+                    )
                 }
                 clean::MethodItem(..) | clean::AssocConstItem(..) => {
                     if self.parent_stack.is_empty() {
@@ -1434,13 +1459,13 @@ impl DocFolder for Cache {
                             Some(&(ref fqp, ItemType::Union)) |
                             Some(&(ref fqp, ItemType::Enum)) =>
                                 Some(&fqp[..fqp.len() - 1]),
-                            Some(..) => Some(&*self.stack),
+                            Some(..) => Some(&*self.path_stack),
                             None => None
                         };
                         ((Some(*last), path), true)
                     }
                 }
-                _ => ((None, Some(&*self.stack)), false)
+                _ => ((None, Some(&*self.path_stack)), false),
             };
 
             match parent {
@@ -1471,10 +1496,10 @@ impl DocFolder for Cache {
             }
         }
 
-        // Keep track of the fully qualified path for this item.
+        // Keep track of the fully qualified path for this item
         let pushed = match item.name {
             Some(ref n) if !n.is_empty() => {
-                self.stack.push(n.to_string());
+                self.path_stack.push(n.to_string());
                 true
             }
             _ => false,
@@ -1487,8 +1512,8 @@ impl DocFolder for Cache {
             clean::ForeignFunctionItem(..) | clean::ForeignStaticItem(..) |
             clean::ConstantItem(..) | clean::StaticItem(..) |
             clean::UnionItem(..) | clean::ForeignTypeItem |
-            clean::MacroItem(..) | clean::ProcMacroItem(..)
-            if !self.stripped_mod => {
+            clean::MacroItem(..) | clean::ProcMacroItem(..) |
+            clean::VariantItem(..) if !self.stripped_mod => {
                 // Re-exported items mean that the same id can show up twice
                 // in the rustdoc ast that we're looking at. We know,
                 // however, that a re-exported item doesn't show up in the
@@ -1499,40 +1524,43 @@ impl DocFolder for Cache {
                    self.access_levels.is_public(item.def_id)
                 {
                     self.paths.insert(item.def_id,
-                                      (self.stack.clone(), item.type_()));
+                                      (self.path_stack.clone(), item.type_()));
                 }
                 self.add_aliases(&item);
-            }
-            // Link variants to their parent enum because pages aren't emitted
-            // for each variant.
-            clean::VariantItem(..) if !self.stripped_mod => {
-                let mut stack = self.stack.clone();
-                stack.pop();
-                self.paths.insert(item.def_id, (stack, ItemType::Enum));
             }
 
             clean::PrimitiveItem(..) if item.visibility.is_some() => {
                 self.add_aliases(&item);
-                self.paths.insert(item.def_id, (self.stack.clone(),
+                self.paths.insert(item.def_id, (self.path_stack.clone(),
                                                 item.type_()));
             }
 
             _ => {}
         }
 
+        // Fill the multimap which is used to determine the full path to a structfield's
+        // documentation when it belongs to a struct-like enum variant.
+        if let clean::VariantItem(clean::Variant{ kind: clean::VariantKind::Struct(..) }) = item.inner {
+            let parent_defid = *self.parent_stack.last().unwrap();
+            self.enum_structvariants.entry(parent_defid).or_insert(vec![]).push(item.def_id);
+        }
+
         // Maintain the parent stack
         let orig_parent_is_trait_impl = self.parent_is_trait_impl;
+        let orig_parent_is_variant = self.parent_is_variant;
         let parent_pushed = match item.inner {
             clean::TraitItem(..) | clean::EnumItem(..) | clean::ForeignTypeItem |
-            clean::StructItem(..) | clean::UnionItem(..) => {
+            clean::StructItem(..) | clean::UnionItem(..) | clean::VariantItem(..) => {
                 self.parent_stack.push(item.def_id);
                 self.parent_is_trait_impl = false;
+                self.parent_is_variant = item.is_variant();
                 true
             }
             clean::ImplItem(ref i) => {
                 self.parent_is_trait_impl = i.trait_.is_some();
+                self.parent_is_variant = false;
                 match i.for_ {
-                    clean::ResolvedPath{ did, .. } => {
+                    clean::ResolvedPath { did, .. } => {
                         self.parent_stack.push(did);
                         true
                     }
@@ -1607,10 +1635,11 @@ impl DocFolder for Cache {
             }
         });
 
-        if pushed { self.stack.pop().unwrap(); }
+        if pushed { self.path_stack.pop().unwrap(); }
         if parent_pushed { self.parent_stack.pop().unwrap(); }
         self.stripped_mod = orig_stripped_mod;
         self.parent_is_trait_impl = orig_parent_is_trait_impl;
+        self.parent_is_variant = orig_parent_is_variant;
         ret
     }
 }
