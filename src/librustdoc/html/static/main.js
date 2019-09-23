@@ -1618,7 +1618,7 @@ function getSearchElement() {
                 var items = rawSearchIndex[crate].i;
                 // an array of [(Number) item type,
                 //              (String) name]
-                var paths = rawSearchIndex[crate].p;
+                var rawPaths = rawSearchIndex[crate].p;
                 // an object where each key is a (String) path index of an enum
                 // variant, and for each key its value is an array of (Number)
                 // path indices for its struct-like variants
@@ -1631,8 +1631,9 @@ function getSearchElement() {
                     }
                 }
 
-                // convert `paths` into object form
-                var len = paths.length;
+                // convert `rawPaths` entries into object form
+                var len = rawPaths.length;
+                var paths = [];
                 for (i = 0; i < len; ++i) {
                     var path = {ty: rawPaths[i][0], name: rawPaths[i][1]};
                     // Struct variants need the enum name to construct their path
